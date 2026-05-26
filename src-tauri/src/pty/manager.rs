@@ -6,6 +6,7 @@
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker};
 use parking_lot::RwLock;
 use portable_pty::{Child, MasterPty, PtySize};
+use tokio::sync::broadcast;
 
 #[cfg(target_os = "windows")]
 use crate::pty::windows::{resize_conpty, spawn_conpty, ConPtyHandles};
@@ -276,6 +277,8 @@ impl Drop for TerminalSlotReservation {
 /// Manages all PTY instances
 pub struct PtyManager {
     terminals: Arc<RwLock<HashMap<String, Arc<TerminalInstance>>>>,
+    /// Broadcast channels for remote terminal output (per terminal ID)
+    broadcasts: Arc<RwLock<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
     active_terminal_slots: Arc<AtomicUsize>,
     id_counter: Arc<AtomicU64>,
     app_handle: AppHandle,
@@ -301,6 +304,7 @@ impl PtyManager {
     ) -> Self {
         Self {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            broadcasts: Arc::new(RwLock::new(HashMap::new())),
             active_terminal_slots: Arc::new(AtomicUsize::new(0)),
             id_counter: Arc::new(AtomicU64::new(0)),
             app_handle,
@@ -542,15 +546,21 @@ impl PtyManager {
             let exit_code_tracker = self.exit_code_tracker.clone();
             let terminal_id = id.clone();
 
+            // Create broadcast channel for remote terminal access
+            let (broadcast_tx, _) = broadcast::channel(crate::remote::BROADCAST_CAPACITY);
+            let broadcast_tx = Arc::new(broadcast_tx);
+            self.broadcasts.write().insert(id.clone(), broadcast_tx.as_ref().clone());
+
             // Spawn flusher thread first (it references pending_buf and done_flag)
             let flusher_pending = pending_buf.clone();
             let flusher_done = done_flag.clone();
             let flusher_channel = on_data.clone();
             let flusher_id = id.clone();
+            let flusher_broadcast = Some(broadcast_tx.clone());
 
             let flusher_task = std::thread::spawn(move || {
                 log::info!("[PTY {}] Flusher thread starting", flusher_id);
-                Self::flusher_loop(flusher_pending, flusher_done, flusher_channel, flusher_id);
+                Self::flusher_loop(flusher_pending, flusher_done, flusher_channel, flusher_id, flusher_broadcast);
             });
 
             // Spawn reader thread
@@ -656,15 +666,21 @@ impl PtyManager {
             let pending_buf = Arc::new(Mutex::new(Vec::with_capacity(READ_BUF)));
             let done_flag = Arc::new(AtomicBool::new(false));
 
+            // Create broadcast channel for remote terminal access
+            let (broadcast_tx, _) = broadcast::channel(crate::remote::BROADCAST_CAPACITY);
+            let broadcast_tx = Arc::new(broadcast_tx);
+            self.broadcasts.write().insert(id.clone(), broadcast_tx.as_ref().clone());
+
             // Spawn flusher thread first
             let flusher_pending = pending_buf.clone();
             let flusher_done = done_flag.clone();
             let flusher_channel = on_data.clone();
             let flusher_id = id.clone();
+            let flusher_broadcast = Some(broadcast_tx.clone());
 
             let flusher_task = std::thread::spawn(move || {
                 log::info!("[PTY {}] Flusher thread starting", flusher_id);
-                Self::flusher_loop(flusher_pending, flusher_done, flusher_channel, flusher_id);
+                Self::flusher_loop(flusher_pending, flusher_done, flusher_channel, flusher_id, flusher_broadcast);
             });
 
             // Spawn reader thread
@@ -821,17 +837,19 @@ impl PtyManager {
     /// ADR-002.3: Flusher thread — batched Channel output at FLUSH_INTERVAL.
     /// Takes pending buffer via std::mem::take every 4ms and sends via binary channel.
     /// If on_data is None, skips sending (just drains).
+    /// Optionally relays output to broadcast channel for remote WebSocket clients.
     fn flusher_loop(
         pending_buf: Arc<Mutex<Vec<u8>>>,
         done_flag: Arc<AtomicBool>,
         on_data: Option<Channel<Response>>,
         terminal_id: String,
+        broadcast_tx: Option<Arc<broadcast::Sender<Vec<u8>>>>,
     ) {
         let id = terminal_id;
         log::info!("[PTY {}] Flusher thread starting", id);
 
-        if on_data.is_none() {
-            // No binary channel — read and discard flusher
+        if on_data.is_none() && broadcast_tx.is_none() {
+            // No binary channel and no broadcast — read and discard flusher
             loop {
                 std::thread::sleep(FLUSH_INTERVAL);
                 if done_flag.load(Ordering::Acquire) {
@@ -846,44 +864,22 @@ impl PtyManager {
             if let Ok(mut guard) = pending_buf.lock() {
                 guard.clear();
             }
-            log::info!("[PTY {}] Flusher thread ended (no channel)", id);
+            log::info!("[PTY {}] Flusher thread ended (no channel, no broadcast)", id);
             return;
         }
-
-        let channel = on_data.unwrap();
 
         loop {
             std::thread::sleep(FLUSH_INTERVAL);
 
-            if done_flag.load(Ordering::Acquire) {
-                // One final flush before exiting
-                let chunk = match pending_buf.lock() {
-                    Ok(mut guard) => {
-                        if guard.is_empty() {
-                            None
-                        } else {
-                            Some(std::mem::take(&mut *guard))
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("[PTY {}] Flusher mutex poisoned: {}", id, e);
-                        break;
-                    }
-                };
-                if let Some(data) = chunk {
-                    if let Err(e) = channel.send(Response::new(data)) {
-                        log::error!("[PTY {}] Failed to send final data via channel: {}", id, e);
-                    }
-                }
-                break;
-            }
+            let is_done = done_flag.load(Ordering::Acquire);
 
             let chunk = match pending_buf.lock() {
                 Ok(mut guard) => {
                     if guard.is_empty() {
-                        continue;
+                        None
+                    } else {
+                        Some(std::mem::take(&mut *guard))
                     }
-                    Some(std::mem::take(&mut *guard))
                 }
                 Err(e) => {
                     log::error!("[PTY {}] Flusher mutex poisoned: {}", id, e);
@@ -892,9 +888,24 @@ impl PtyManager {
             };
 
             if let Some(data) = chunk {
-                if let Err(e) = channel.send(Response::new(data)) {
-                    log::error!("[PTY {}] Failed to send data via channel: {}", id, e);
+                // Send to Tauri channel (desktop frontend)
+                if let Some(ref channel) = on_data {
+                    if let Err(e) = channel.send(Response::new(data.clone())) {
+                        log::error!("[PTY {}] Failed to send data via channel: {}", id, e);
+                    }
                 }
+
+                // Relay to broadcast channel (remote WebSocket clients)
+                // Note: send() is non-blocking and safe to call from std::thread
+                if let Some(ref tx) = broadcast_tx {
+                    if let Err(e) = tx.send(data) {
+                        log::trace!("[PTY {}] Broadcast send failed (no receivers): {}", id, e);
+                    }
+                }
+            }
+
+            if is_done {
+                break;
             }
         }
 
@@ -1004,6 +1015,9 @@ impl PtyManager {
             .remove(id)
             .ok_or_else(|| format!("Terminal not found: {}", id))?;
 
+        // Clean up broadcast channel
+        self.broadcasts.write().remove(id);
+
         self.release_terminal_slot();
 
         // Wrap blocking cleanup in spawn_blocking to avoid panic
@@ -1050,6 +1064,32 @@ impl PtyManager {
         self.terminals.read().values().cloned().collect()
     }
 
+    /// List all active terminals with their public info (for remote API).
+    /// Returns a vector of `TerminalInfo` structs suitable for JSON serialization.
+    pub fn list_active(&self) -> Vec<TerminalInfo> {
+        self.terminals
+            .read()
+            .values()
+            .map(|inst| TerminalInfo {
+                id: inst.id.clone(),
+                shell: inst.shell.clone(),
+                cwd: inst.cwd.clone(),
+                pid: inst.pid,
+                cols: *inst.cols.read(),
+                rows: *inst.rows.read(),
+            })
+            .collect()
+    }
+
+    /// Subscribe to a terminal's broadcast channel for remote output.
+    /// Returns a `broadcast::Receiver` that yields `Vec<u8>` chunks of terminal output,
+    /// or `None` if the terminal does not exist.
+    ///
+    /// Used by the remote WebSocket server to relay PTY output to web clients.
+    pub fn subscribe_broadcast(&self, id: &str) -> Option<broadcast::Receiver<Vec<u8>>> {
+        self.broadcasts.read().get(id).map(|tx| tx.subscribe())
+    }
+
     /// Get terminal count
     pub fn get_count(&self) -> usize {
         self.terminals.read().len()
@@ -1075,6 +1115,9 @@ impl PtyManager {
                 Some(i) => i,
                 None => continue,
             };
+
+            // Clean up broadcast channel
+            self.broadcasts.write().remove(&id);
 
             self.release_terminal_slot();
 

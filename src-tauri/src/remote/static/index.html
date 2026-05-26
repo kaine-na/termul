@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Termul Remote</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text: #e6edf3;
+            --text-muted: #8b949e;
+            --accent: #58a6ff;
+            --danger: #f85149;
+            --success: #3fb950;
+            --warning: #d29922;
+            --border: #30363d;
+            --radius: 8px;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 16px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            min-height: 44px;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .header h1 {
+            font-size: 14px;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            background: var(--bg-tertiary);
+            color: var(--text-muted);
+        }
+
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        .status-dot.connected { background: var(--success); }
+        .status-dot.error { background: var(--danger); }
+        .status-dot.connecting { background: var(--warning); animation: pulse 1.5s ease-in-out infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* Main area */
+        .main {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Sidebar — terminal list */
+        .sidebar {
+            width: 200px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+
+        .sidebar-header {
+            padding: 10px 12px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .terminal-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px;
+        }
+
+        .terminal-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-radius: var(--radius);
+            cursor: pointer;
+            font-size: 13px;
+            color: var(--text-muted);
+            transition: background 0.15s;
+        }
+
+        .terminal-item:hover { background: var(--bg-tertiary); color: var(--text); }
+        .terminal-item.active { background: var(--accent); color: #fff; }
+
+        .terminal-icon {
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+
+        .terminal-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+        }
+
+        .empty-state {
+            padding: 16px 12px;
+            text-align: center;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        /* Terminal area */
+        .terminal-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .tab-bar {
+            display: flex;
+            align-items: center;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 0 4px;
+            min-height: 36px;
+            overflow-x: auto;
+            gap: 2px;
+        }
+
+        .tab {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            font-size: 12px;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-radius: var(--radius) var(--radius) 0 0;
+            white-space: nowrap;
+            transition: background 0.15s;
+        }
+
+        .tab:hover { background: var(--bg-tertiary); }
+        .tab.active { background: var(--bg); color: var(--text); }
+
+        .tab-close {
+            font-size: 10px;
+            opacity: 0.5;
+            cursor: pointer;
+        }
+
+        .tab-close:hover { opacity: 1; }
+
+        #terminal-container {
+            flex: 1;
+            padding: 4px;
+            overflow: hidden;
+        }
+
+        /* Token input modal */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.6);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+
+        .modal-overlay.hidden { display: none; }
+
+        .modal {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            width: 360px;
+            max-width: 90vw;
+        }
+
+        .modal h2 {
+            font-size: 16px;
+            margin-bottom: 8px;
+        }
+
+        .modal p {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-bottom: 16px;
+        }
+
+        .modal input {
+            width: 100%;
+            padding: 8px 12px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text);
+            font-size: 13px;
+            outline: none;
+        }
+
+        .modal input:focus { border-color: var(--accent); }
+
+        .modal button {
+            margin-top: 12px;
+            width: 100%;
+            padding: 8px;
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            border-radius: var(--radius);
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .modal button:hover { filter: brightness(1.1); }
+
+        /* Security warning */
+        .security-notice {
+            padding: 8px 12px;
+            background: #3d2e00;
+            border-bottom: 1px solid var(--warning);
+            font-size: 11px;
+            color: var(--warning);
+            text-align: center;
+        }
+
+        /* No terminal placeholder */
+        .placeholder {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
+            font-size: 14px;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .placeholder-icon {
+            font-size: 48px;
+            opacity: 0.3;
+        }
+
+        /* Responsive */
+        @media (max-width: 600px) {
+            .sidebar { width: 140px; }
+        }
+    </style>
+</head>
+<body>
+    <!-- Token Input Modal -->
+    <div class="modal-overlay hidden" id="token-modal">
+        <div class="modal">
+            <h2>🔑 Authentication Required</h2>
+            <p>Enter the session token displayed in Termul's status bar to connect.</p>
+            <input type="password" id="token-input" placeholder="Paste session token..." autocomplete="off">
+            <button onclick="submitToken()">Connect</button>
+        </div>
+    </div>
+
+    <!-- Security Notice -->
+    <div class="security-notice" id="security-notice">
+        ⚠️ Remote terminal access is active. Anyone with the session token can control your terminals.
+    </div>
+
+    <!-- Header -->
+    <div class="header">
+        <div class="header-left">
+            <h1>🖥 Termul Remote</h1>
+            <span class="status-badge" id="status-badge">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text">Disconnected</span>
+            </span>
+        </div>
+    </div>
+
+    <!-- Main Area -->
+    <div class="main">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">Terminals</div>
+            <div class="terminal-list" id="terminal-list">
+                <div class="empty-state">No terminals</div>
+            </div>
+        </div>
+
+        <!-- Terminal Area -->
+        <div class="terminal-area">
+            <div class="tab-bar" id="tab-bar"></div>
+            <div id="terminal-container">
+                <div class="placeholder">
+                    <div class="placeholder-icon">🖥</div>
+                    <div>Select a terminal from the sidebar</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+    <script>
+    (function() {
+        'use strict';
+
+        // === State ===
+        let ws = null;
+        let token = null;
+        let currentTerminalId = null;
+        /** @type {Map<string, {term: Terminal, fitAddon: FitAddon.FitAddon}>} */
+        const terminals = new Map();
+        /** @type {Array<{id: string, shell: string, cwd: string}>} */
+        let terminalList = [];
+
+        // === DOM refs ===
+        const terminalContainer = document.getElementById('terminal-container');
+        const terminalListEl = document.getElementById('terminal-list');
+        const tabBarEl = document.getElementById('tab-bar');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const tokenModal = document.getElementById('token-modal');
+        const tokenInput = document.getElementById('token-input');
+
+        // === Init ===
+        function init() {
+            // Extract token from URL
+            const params = new URLSearchParams(window.location.search);
+            token = params.get('token');
+
+            if (!token) {
+                tokenModal.classList.remove('hidden');
+                tokenInput.focus();
+            } else {
+                connect();
+            }
+        }
+
+        // === Token submission ===
+        window.submitToken = function() {
+            token = tokenInput.value.trim();
+            if (!token) return;
+            tokenModal.classList.add('hidden');
+            // Update URL without reload
+            const url = new URL(window.location);
+            url.searchParams.set('token', token);
+            window.history.replaceState({}, '', url);
+            connect();
+        };
+
+        tokenInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') window.submitToken();
+        });
+
+        // === WebSocket Connection ===
+        function connect() {
+            setStatus('connecting', 'Connecting...');
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function() {
+                setStatus('connected', 'Connected');
+            };
+
+            ws.onmessage = function(event) {
+                try {
+                    const msg = JSON.parse(event.data);
+                    handleMessage(msg);
+                } catch (e) {
+                    console.warn('Invalid WS message:', e);
+                }
+            };
+
+            ws.onclose = function() {
+                setStatus('error', 'Disconnected');
+                // Attempt reconnection after 3 seconds
+                setTimeout(function() {
+                    if (token) connect();
+                }, 3000);
+            };
+
+            ws.onerror = function(err) {
+                console.error('WebSocket error:', err);
+                setStatus('error', 'Error');
+            };
+        }
+
+        // === Message handling ===
+        function handleMessage(msg) {
+            switch (msg.type) {
+                case 'terminal_list':
+                    terminalList = msg.terminals || [];
+                    renderTerminalList();
+                    break;
+
+                case 'data':
+                    if (currentTerminalId && terminals.has(currentTerminalId)) {
+                        const { term } = terminals.get(currentTerminalId);
+                        term.write(msg.data);
+                    }
+                    break;
+
+                case 'connected':
+                    console.log('Attached to terminal:', msg.terminalId);
+                    break;
+
+                case 'exit':
+                    if (terminals.has(msg.terminalId)) {
+                        const { term } = terminals.get(msg.terminalId);
+                        term.writeln('\r\n\x1b[31m[Process exited]\x1b[0m');
+                    }
+                    break;
+
+                case 'error':
+                    console.error('Server error:', msg.message);
+                    if (currentTerminalId && terminals.has(currentTerminalId)) {
+                        const { term } = terminals.get(currentTerminalId);
+                        term.writeln(`\r\n\x1b[33m[Error: ${msg.message}]\x1b[0m`);
+                    }
+                    break;
+            }
+        }
+
+        // === Terminal list rendering ===
+        function renderTerminalList() {
+            if (terminalList.length === 0) {
+                terminalListEl.innerHTML = '<div class="empty-state">No active terminals.<br>Open a terminal in Termul first.</div>';
+                return;
+            }
+
+            terminalListEl.innerHTML = terminalList.map(function(t) {
+                const name = t.shell ? t.shell.split('/').pop().split('\\').pop() : t.id;
+                const isActive = t.id === currentTerminalId;
+                return `<div class="terminal-item ${isActive ? 'active' : ''}" data-id="${t.id}" onclick="window._selectTerminal('${t.id}')">
+                    <span class="terminal-icon">📟</span>
+                    <span class="terminal-name" title="${t.cwd || t.id}">${name} <small style="opacity:0.5">${t.id.slice(-4)}</small></span>
+                </div>`;
+            }).join('');
+        }
+
+        // === Terminal selection ===
+        window._selectTerminal = function(id) {
+            if (currentTerminalId === id) return;
+            currentTerminalId = id;
+
+            // Create terminal if not exists
+            if (!terminals.has(id)) {
+                createTerminal(id);
+            }
+
+            // Show this terminal, hide others
+            terminals.forEach(function(val, key) {
+                val.term.element.style.display = key === id ? '' : 'none';
+            });
+
+            // Fit and focus
+            const { term, fitAddon } = terminals.get(id);
+            setTimeout(function() {
+                fitAddon.fit();
+                term.focus();
+            }, 50);
+
+            // Send attach message
+            send({ type: 'attach', terminal_id: id });
+
+            // Update UI
+            renderTerminalList();
+            renderTabs();
+
+            // Remove placeholder
+            const placeholder = terminalContainer.querySelector('.placeholder');
+            if (placeholder) placeholder.remove();
+        };
+
+        // === Terminal creation ===
+        function createTerminal(id) {
+            const term = new Terminal({
+                cursorBlink: true,
+                fontSize: 14,
+                fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", Menlo, monospace',
+                theme: {
+                    background: '#0d1117',
+                    foreground: '#e6edf3',
+                    cursor: '#58a6ff',
+                    cursorAccent: '#0d1117',
+                    selectionBackground: '#264f78',
+                    black: '#484f58',
+                    red: '#ff7b72',
+                    green: '#3fb950',
+                    yellow: '#d29922',
+                    blue: '#58a6ff',
+                    magenta: '#bc8cff',
+                    cyan: '#39d353',
+                    white: '#e6edf3',
+                    brightBlack: '#6e7681',
+                    brightRed: '#ffa198',
+                    brightGreen: '#56d364',
+                    brightYellow: '#e3b341',
+                    brightBlue: '#79c0ff',
+                    brightMagenta: '#d2a8ff',
+                    brightCyan: '#56d364',
+                    brightWhite: '#f0f6fc',
+                },
+                allowProposedApi: true,
+            });
+
+            const fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+            term.loadAddon(new WebLinksAddon.WebLinksAddon());
+
+            // Append to container
+            const wrapper = document.createElement('div');
+            wrapper.style.height = '100%';
+            terminalContainer.appendChild(wrapper);
+            term.open(wrapper);
+
+            try {
+                fitAddon.fit();
+            } catch(e) {
+                // Ignore fit errors during init
+            }
+
+            // Handle input
+            term.onData(function(data) {
+                send({ type: 'input', data: data });
+            });
+
+            // Handle resize
+            term.onResize(function(size) {
+                send({ type: 'resize', cols: size.cols, rows: size.rows });
+            });
+
+            terminals.set(id, { term, fitAddon, element: wrapper });
+        }
+
+        // === Tab bar ===
+        function renderTabs() {
+            tabBarEl.innerHTML = Array.from(terminals.keys()).map(function(id) {
+                const info = terminalList.find(function(t) { return t.id === id; });
+                const name = info ? (info.shell || '').split('/').pop().split('\\').pop() : id;
+                const isActive = id === currentTerminalId;
+                return `<div class="tab ${isActive ? 'active' : ''}" onclick="window._selectTerminal('${id}')">
+                    📟 ${name || id.slice(-6)}
+                    <span class="tab-close" onclick="event.stopPropagation(); window._closeTerminal('${id}')">✕</span>
+                </div>`;
+            }).join('');
+        }
+
+        window._closeTerminal = function(id) {
+            if (terminals.has(id)) {
+                const { term, element } = terminals.get(id);
+                term.dispose();
+                element.remove();
+                terminals.delete(id);
+            }
+            if (currentTerminalId === id) {
+                currentTerminalId = null;
+                // Switch to next available
+                const next = terminalList.find(function(t) { return terminals.has(t.id); });
+                if (next) {
+                    window._selectTerminal(next.id);
+                } else {
+                    terminalContainer.innerHTML = '<div class="placeholder"><div class="placeholder-icon">🖥</div><div>Select a terminal from the sidebar</div></div>';
+                }
+            }
+            renderTabs();
+        };
+
+        // === WebSocket send helper ===
+        function send(msg) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(msg));
+            }
+        }
+
+        // === Status display ===
+        function setStatus(state, text) {
+            statusDot.className = 'status-dot ' + state;
+            statusText.textContent = text;
+        }
+
+        // === Window resize → fit terminal ===
+        let resizeTimeout;
+        window.addEventListener('resize', function() {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(function() {
+                if (currentTerminalId && terminals.has(currentTerminalId)) {
+                    try {
+                        terminals.get(currentTerminalId).fitAddon.fit();
+                    } catch(e) { /* ignore */ }
+                }
+            }, 100);
+        });
+
+        // === Start ===
+        init();
+    })();
+    </script>
+</body>
+</html>

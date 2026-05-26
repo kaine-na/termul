@@ -3,6 +3,7 @@ mod browser_tab_manager;
 mod commands;
 mod migrations;
 mod pty;
+mod remote;
 mod shell_paths;
 mod trackers;
 
@@ -656,6 +657,11 @@ pub fn run() {
             let browser_tab_manager = Arc::new(browser_tab_manager::BrowserTabManager::new(handle.clone()));
             app.manage(browser_tab_manager);
 
+            // Remote Terminal Server State
+            let remote_server_state: Arc<Mutex<Option<remote::server::ServerHandle>>> =
+                Arc::new(Mutex::new(None));
+            app.manage(remote_server_state);
+
             // Create Migration Manager
             let migration_manager = Arc::new(MigrationManager::new(handle.clone()));
             app.manage(migration_manager.clone());
@@ -758,6 +764,10 @@ pub fn run() {
             commands::data_migration_get_schema_info,
             commands::data_migration_get_registered,
             commands::data_migration_rollback,
+            // Remote terminal commands
+            commands::remote_start,
+            commands::remote_stop,
+            commands::remote_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

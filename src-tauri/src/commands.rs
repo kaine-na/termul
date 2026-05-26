@@ -1343,3 +1343,112 @@ mod tests {
         assert_eq!(result.code, Some("TEST_ERROR".to_string()));
     }
 }
+
+// ==================== Remote Terminal Commands ====================
+
+/// Start the remote terminal HTTP + WebSocket server.
+///
+/// The server binds to `127.0.0.1` by default (LAN-only with `bind_lan: true`).
+/// Returns the server URL and authentication token for connecting web clients.
+///
+/// # Security
+/// - Default bind: `127.0.0.1:{port}` (localhost only)
+/// - Token-based authentication required for all connections
+/// - Origin validation prevents Cross-Site WebSocket Hijacking
+#[tauri::command]
+pub async fn remote_start(
+    port: Option<u16>,
+    bind_lan: Option<bool>,
+    pty_manager: State<'_, Arc<PtyManager>>,
+    remote_state: State<'_, Arc<Mutex<Option<crate::remote::server::ServerHandle>>>>,
+) -> Result<IpcResult<serde_json::Value>, String> {
+    use crate::remote::{server, DEFAULT_PORT};
+
+    // Check if already running
+    {
+        let state = remote_state.lock().map_err(|e| e.to_string())?;
+        if state.is_some() {
+            return Ok(IpcResult::error("Remote server already running", "ALREADY_RUNNING"));
+        }
+    }
+
+    let port = port.unwrap_or(DEFAULT_PORT);
+    let bind_lan = bind_lan.unwrap_or(false);
+
+    match server::start_server(pty_manager.inner().clone(), port, bind_lan).await {
+        Ok(handle) => {
+            let token = handle.token().to_string();
+            let host = if bind_lan { "0.0.0.0" } else { "127.0.0.1" };
+            let url = format!("http://{}:{}?token={}", host, port, token);
+
+            let response = serde_json::json!({
+                "port": port,
+                "token": token,
+                "url": url,
+                "bindLan": bind_lan,
+            });
+
+            // Store handle
+            {
+                let mut state = remote_state.lock().map_err(|e| e.to_string())?;
+                *state = Some(handle);
+            }
+
+            log::info!("[Remote] Server started on port {} (LAN: {})", port, bind_lan);
+            Ok(IpcResult::success(response))
+        }
+        Err(e) => {
+            log::error!("[Remote] Failed to start server: {}", e);
+            Ok(IpcResult::error(e, "START_FAILED"))
+        }
+    }
+}
+
+/// Stop the remote terminal server.
+///
+/// Gracefully shuts down the HTTP + WebSocket server and releases the port.
+#[tauri::command]
+pub async fn remote_stop(
+    remote_state: State<'_, Arc<Mutex<Option<crate::remote::server::ServerHandle>>>>,
+) -> Result<IpcResult<()>, String> {
+    let handle = {
+        let mut state = remote_state.lock().map_err(|e| e.to_string())?;
+        state.take()
+    };
+
+    match handle {
+        Some(h) => {
+            if let Err(e) = h.stop().await {
+                log::error!("[Remote] Error stopping server: {}", e);
+                return Ok(IpcResult::error(e, "STOP_FAILED"));
+            }
+            log::info!("[Remote] Server stopped");
+            Ok(IpcResult::success(()))
+        }
+        None => Ok(IpcResult::error("Remote server not running", "NOT_RUNNING")),
+    }
+}
+
+/// Get the current status of the remote terminal server.
+///
+/// Returns whether the server is running, and if so, the port and URL.
+#[tauri::command]
+pub fn remote_status(
+    remote_state: State<'_, Arc<Mutex<Option<crate::remote::server::ServerHandle>>>>,
+) -> Result<IpcResult<serde_json::Value>, String> {
+    let state = remote_state.lock().map_err(|e| e.to_string())?;
+
+    let response = match state.as_ref() {
+        Some(handle) => serde_json::json!({
+            "running": true,
+            "port": handle.port(),
+            "token": handle.token(),
+            "url": format!("http://127.0.0.1:{}?token={}", handle.port(), handle.token()),
+        }),
+        None => serde_json::json!({
+            "running": false,
+        }),
+    };
+
+    Ok(IpcResult::success(response))
+}
