@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { RotateCcw, Keyboard, Download, CheckCircle2, AlertCircle, ExternalLink, X } from 'lucide-react'
+import { RotateCcw, Keyboard, Download, CheckCircle2, AlertCircle, ExternalLink, X, Globe, Copy, Check, Shield } from 'lucide-react'
 import {
   useTerminalFontFamily,
   useTerminalFontSize,
@@ -37,6 +37,7 @@ import {
 import { useUpdaterState, useUpdaterActions } from '@/stores/updater-store'
 import { shellApi, terminalApi } from '@/lib/api'
 import { isAurUpdateMode } from '@/lib/tauri-updater-api'
+import { useRemoteStore } from '@/stores/remote-store'
 
 export default function AppPreferences(): React.JSX.Element {
   const navigate = useNavigate()
@@ -67,6 +68,53 @@ export default function AppPreferences(): React.JSX.Element {
   // Updater state
   const { isChecking, updateAvailable, version, lastChecked, autoUpdateEnabled, skippedVersion, error: updateError, isManualUpdateMode } = useUpdaterState()
   const { checkForUpdates, downloadUpdate, installAndRestart, setAutoUpdateEnabled } = useUpdaterActions()
+
+  // Remote server state
+  const remoteIsRunning = useRemoteStore((s) => s.isRunning)
+  const remotePort = useRemoteStore((s) => s.port)
+  const remoteUrl = useRemoteStore((s) => s.url)
+  const remoteIsLoading = useRemoteStore((s) => s.isLoading)
+  const remoteError = useRemoteStore((s) => s.error)
+  const remoteStart = useRemoteStore((s) => s.start)
+  const remoteStop = useRemoteStore((s) => s.stop)
+  const remoteClearError = useRemoteStore((s) => s.clearError)
+  const remoteRefreshStatus = useRemoteStore((s) => s.refreshStatus)
+  const [remotePortInput, setRemotePortInput] = useState('19480')
+  const [remoteBindLan, setRemoteBindLan] = useState(false)
+  const [remoteUrlCopied, setRemoteUrlCopied] = useState(false)
+
+  // Sync port input when server starts
+  useEffect(() => {
+    if (remotePort) {
+      setRemotePortInput(String(remotePort))
+    }
+  }, [remotePort])
+
+  // Check remote status on mount
+  useEffect(() => {
+    void remoteRefreshStatus()
+  }, [remoteRefreshStatus])
+
+  const handleRemoteToggle = async () => {
+    if (remoteIsRunning) {
+      await remoteStop()
+    } else {
+      const port = parseInt(remotePortInput, 10)
+      if (isNaN(port) || port < 1 || port > 65535) {
+        alert('Invalid port number. Please enter a value between 1 and 65535.')
+        return
+      }
+      await remoteStart(port, remoteBindLan)
+    }
+  }
+
+  const handleCopyRemoteUrl = async () => {
+    if (remoteUrl) {
+      await navigator.clipboard.writeText(remoteUrl)
+      setRemoteUrlCopied(true)
+      setTimeout(() => setRemoteUrlCopied(false), 2000)
+    }
+  }
 
   // Load available shells
   useEffect(() => {
@@ -191,6 +239,134 @@ export default function AppPreferences(): React.JSX.Element {
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-8 pb-32">
           <div className="max-w-4xl mx-auto space-y-12">
+          {/* Remote Terminal Section */}
+          <section className="border-b pb-6 mb-6">
+            <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+              <Globe className="w-5 h-5" />
+              Remote Terminal
+            </h2>
+            <p className="text-muted-foreground text-sm mb-6">
+              Access your terminal from any device on your network via a web browser.
+            </p>
+
+            <div className="space-y-4">
+              {/* Toggle and Status */}
+              <div className="flex items-center justify-between p-4 bg-muted/30 rounded-lg">
+                <div className="flex items-center gap-3">
+                  <div className={`w-3 h-3 rounded-full ${remoteIsRunning ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
+                  <div>
+                    <div className="font-medium">
+                      {remoteIsRunning ? 'Server Running' : 'Server Stopped'}
+                    </div>
+                    {remoteIsRunning && remoteUrl && (
+                      <div className="text-sm text-muted-foreground mt-0.5">
+                        Listening on port {remotePort}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <button
+                  onClick={handleRemoteToggle}
+                  disabled={remoteIsLoading}
+                  className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                    remoteIsRunning
+                      ? 'bg-red-500 hover:bg-red-600 text-white'
+                      : 'bg-green-500 hover:bg-green-600 text-white'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  {remoteIsLoading ? 'Loading...' : remoteIsRunning ? 'Stop Server' : 'Start Server'}
+                </button>
+              </div>
+
+              {/* Error Message */}
+              {remoteError && (
+                <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-500 text-sm flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <div className="flex-1">{remoteError}</div>
+                  <button onClick={remoteClearError} className="text-red-500 hover:text-red-400">
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+
+              {/* Configuration (only when stopped) */}
+              {!remoteIsRunning && (
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium mb-2">Port Number</label>
+                    <input
+                      type="number"
+                      value={remotePortInput}
+                      onChange={(e) => setRemotePortInput(e.target.value)}
+                      min="1"
+                      max="65535"
+                      className="w-full px-3 py-2 bg-muted/30 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
+                      placeholder="19480"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Port to listen on (default: 19480)
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={remoteBindLan}
+                        onChange={(e) => setRemoteBindLan(e.target.checked)}
+                        className="w-4 h-4 rounded"
+                      />
+                      <span className="text-sm font-medium">Allow LAN Access</span>
+                    </label>
+                    <p className="text-xs text-muted-foreground mt-1 ml-6">
+                      {remoteBindLan
+                        ? 'Bind to 0.0.0.0 — accessible from other devices on your network'
+                        : 'Bind to 127.0.0.1 — only accessible from this device'}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* URL Display (when running) */}
+              {remoteIsRunning && remoteUrl && (
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium mb-2">Access URL</label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={remoteUrl}
+                        readOnly
+                        className="flex-1 px-3 py-2 bg-muted/30 border border-border rounded-lg font-mono text-sm"
+                      />
+                      <button
+                        onClick={handleCopyRemoteUrl}
+                        className="px-4 py-2 bg-primary hover:bg-primary/90 text-primary-foreground rounded-lg font-medium transition-colors flex items-center gap-2"
+                      >
+                        {remoteUrlCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                        {remoteUrlCopied ? 'Copied!' : 'Copy'}
+                      </button>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Share this URL with others to give them terminal access
+                    </p>
+                  </div>
+
+                  {/* Security Warning */}
+                  <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg text-yellow-600 dark:text-yellow-500 text-sm flex items-start gap-2">
+                    <Shield className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    <div className="flex-1">
+                      <div className="font-medium mb-1">Security Notice</div>
+                      <p className="text-xs leading-relaxed">
+                        Anyone with this URL can execute commands on your system. Only share with trusted users and stop the server when not in use.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+
           {/* Terminal Appearance Section */}
           <section>
             <div className="flex items-start gap-6 border-b border-border pb-8">

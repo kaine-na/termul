@@ -1,4 +1,5 @@
-import { Server, GitBranch, Folder, Bell, Pencil, Plus, FileQuestion, Download } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Server, GitBranch, Folder, Bell, Pencil, Plus, FileQuestion, Download, Globe, Copy, Check } from 'lucide-react'
 import type { Project } from '@/types/project'
 import { statusBarColors } from '@/lib/colors'
 import { cn } from '@/lib/utils'
@@ -13,6 +14,7 @@ import {
   useShowExitCode
 } from '@/stores/context-bar-settings-store'
 import { useUpdateDownloaded, useUpdateVersion } from '@/stores/updater-store'
+import { useRemoteStore } from '@/stores/remote-store'
 
 interface StatusBarProps {
   project: Project | undefined
@@ -32,6 +34,27 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
   // Updater state
   const updateDownloaded = useUpdateDownloaded()
   const updateVersion = useUpdateVersion()
+
+  // Remote server state
+  const remoteIsRunning = useRemoteStore((s) => s.isRunning)
+  const remotePort = useRemoteStore((s) => s.port)
+  const remoteUrl = useRemoteStore((s) => s.url)
+  const remoteStop = useRemoteStore((s) => s.stop)
+  const remoteRefreshStatus = useRemoteStore((s) => s.refreshStatus)
+  const [remoteUrlCopied, setRemoteUrlCopied] = useState(false)
+
+  // Check remote status on mount
+  useEffect(() => {
+    void remoteRefreshStatus()
+  }, [remoteRefreshStatus])
+
+  const handleCopyRemoteUrl = async () => {
+    if (remoteUrl) {
+      await navigator.clipboard.writeText(remoteUrl)
+      setRemoteUrlCopied(true)
+      setTimeout(() => setRemoteUrlCopied(false), 2000)
+    }
+  }
 
   // Display terminal CWD if available, otherwise fall back to project path
   const displayPath = activeTerminal?.cwd || project?.path
@@ -104,6 +127,44 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
 
       {/* Right side */}
       <div className="flex items-center space-x-4">
+        {/* Remote Terminal Indicator */}
+        {remoteIsRunning && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="flex items-center">
+                <StatusItem
+                  icon={<Globe size={14} />}
+                  className="text-green-400"
+                >
+                  <span className="w-2 h-2 rounded-full bg-green-400 mr-1.5 animate-pulse" />
+                  Remote :{remotePort}
+                </StatusItem>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-sm">
+              <div className="space-y-2">
+                <p className="font-medium">Remote Terminal Active</p>
+                <p className="text-xs opacity-80 break-all">{remoteUrl}</p>
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={handleCopyRemoteUrl}
+                    className="flex items-center gap-1 text-xs px-2 py-1 bg-white/10 hover:bg-white/20 rounded transition-colors"
+                  >
+                    {remoteUrlCopied ? <Check size={12} /> : <Copy size={12} />}
+                    {remoteUrlCopied ? 'Copied!' : 'Copy URL'}
+                  </button>
+                  <button
+                    onClick={() => void remoteStop()}
+                    className="text-xs px-2 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded transition-colors"
+                  >
+                    Stop
+                  </button>
+                </div>
+              </div>
+            </TooltipContent>
+          </Tooltip>
+        )}
+
         {showExitCode && lastExitCode !== null && lastExitCode !== undefined && (
           <Tooltip>
             <TooltipTrigger asChild>
