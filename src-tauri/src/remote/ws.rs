@@ -94,14 +94,20 @@ impl ServerMessage {
 ///
 /// Lifecycle:
 /// 1. Send terminal list to client
-/// 2. Wait for `attach` message from client
+/// 2. Wait for `attach` message from client (with timeout)
 /// 3. Subscribe to terminal's broadcast channel
 /// 4. Bidirectional relay: PTY output → WS, WS input → PTY
 /// 5. Cleanup on disconnect
 pub async fn handle_terminal_ws(socket: WebSocket, state: AppState) {
-    // Increment global connection count
-    state.connection_count.fetch_add(1, Ordering::SeqCst);
-    log::info!("[RemoteWS] New WebSocket connection");
+    // Increment global connection count (atomically, with limit check)
+    let prev = state.connection_count.fetch_add(1, Ordering::SeqCst);
+    if prev >= super::MAX_TOTAL_CONNECTIONS {
+        // Over limit — rollback and close
+        state.connection_count.fetch_sub(1, Ordering::SeqCst);
+        log::warn!("[RemoteWS] Connection rejected: limit reached ({prev})");
+        return;
+    }
+    log::info!("[RemoteWS] New WebSocket connection ({}/{})", prev + 1, super::MAX_TOTAL_CONNECTIONS);
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -117,36 +123,60 @@ pub async fn handle_terminal_ws(socket: WebSocket, state: AppState) {
         return;
     }
 
-    // Wait for attach message
-    let terminal_id = loop {
-        match ws_rx.next().await {
-            Some(Ok(Message::Text(text))) => {
-                if let Ok(ClientMessage::Attach { terminal_id }) =
-                    serde_json::from_str::<ClientMessage>(&text)
-                {
-                    break terminal_id;
+    // Wait for attach message (with timeout to prevent resource exhaustion)
+    const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+    let terminal_id = match time::timeout(ATTACH_TIMEOUT, async {
+        loop {
+            match ws_rx.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(ClientMessage::Attach { terminal_id }) =
+                        serde_json::from_str::<ClientMessage>(&text)
+                    {
+                        return Some(terminal_id);
+                    }
+                    let err_msg = ServerMessage::Error {
+                        message: "Expected attach message".to_string(),
+                    };
+                    let _ = ws_tx.send(Message::Text(err_msg.to_json())).await;
                 }
-                let err_msg = ServerMessage::Error {
-                    message: "Expected attach message".to_string(),
-                };
-                let _ = ws_tx.send(Message::Text(err_msg.to_json())).await;
+                Some(Ok(Message::Close(_))) | None => return None,
+                _ => continue,
             }
-            Some(Ok(Message::Close(_))) | None => {
-                log::info!("[RemoteWS] Client disconnected before attaching");
-                state.connection_count.fetch_sub(1, Ordering::SeqCst);
-                return;
-            }
-            _ => continue,
+        }
+    })
+    .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            log::info!("[RemoteWS] Client disconnected before attaching");
+            state.connection_count.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        Err(_) => {
+            log::warn!("[RemoteWS] Attach timeout ({}s)", ATTACH_TIMEOUT.as_secs());
+            let err_msg = ServerMessage::Error {
+                message: "Attach timeout".to_string(),
+            };
+            let _ = ws_tx.send(Message::Text(err_msg.to_json())).await;
+            state.connection_count.fetch_sub(1, Ordering::SeqCst);
+            return;
         }
     };
 
-    // Check per-terminal connection limit
-    let renderer_count = state
-        .pty_manager
-        .get(&terminal_id)
-        .map(|t| t.renderer_ref_count())
-        .unwrap_or(0);
-    if renderer_count >= MAX_CONNECTIONS_PER_TERMINAL {
+    // Atomically check and reserve per-terminal connection slot (TOCTOU-safe)
+    let terminal_instance = match state.pty_manager.get(&terminal_id) {
+        Some(inst) => inst,
+        None => {
+            let err_msg = ServerMessage::Error {
+                message: format!("Terminal not found: {terminal_id}"),
+            };
+            let _ = ws_tx.send(Message::Text(err_msg.to_json())).await;
+            state.connection_count.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+    };
+
+    if !terminal_instance.try_add_remote_connection(MAX_CONNECTIONS_PER_TERMINAL) {
         let err_msg = ServerMessage::Error {
             message: format!(
                 "Connection limit per terminal reached ({MAX_CONNECTIONS_PER_TERMINAL})"
@@ -240,6 +270,10 @@ pub async fn handle_terminal_ws(socket: WebSocket, state: AppState) {
     let _ = state
         .pty_manager
         .remove_renderer_ref(&terminal_id, &renderer_id);
+    // Release atomic remote connection slot
+    if let Some(inst) = state.pty_manager.get(&terminal_id) {
+        inst.remove_remote_connection();
+    }
     state.connection_count.fetch_sub(1, Ordering::SeqCst);
     log::info!("[RemoteWS] Connection closed: {terminal_id}");
 }
@@ -258,9 +292,13 @@ async fn handle_client_input(
             }
         }
         Ok(ClientMessage::Resize { cols, rows }) => {
-            if let Err(e) = state.pty_manager.resize(terminal_id, cols, rows).await {
-                log::warn!("[RemoteWS] Resize error: {e}");
-            }
+            // Note: resize is DISABLED for web clients because the PTY is shared
+            // with the desktop app. Resizing from web would affect the desktop user's
+            // terminal dimensions. This may be re-enabled when per-client virtual
+            // terminals are implemented.
+            log::debug!(
+                "[RemoteWS] Resize request ({cols}x{rows}) ignored — shared PTY"
+            );
         }
         Ok(ClientMessage::Attach { .. }) => {
             let err_msg = ServerMessage::Error {

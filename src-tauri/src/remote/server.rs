@@ -11,7 +11,7 @@
 //! via Tauri commands from the desktop frontend.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use axum::{
@@ -128,15 +128,15 @@ pub async fn start_server(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let task_handle = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
+        if let Err(e) = axum::serve(listener, app.into_make_service())
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
                 log::info!("[RemoteServer] Shutdown signal received");
             })
             .await
-            .unwrap_or_else(|e| {
-                log::error!("[RemoteServer] Server error: {e}");
-            });
+        {
+            log::error!("[RemoteServer] Server error: {e}");
+        }
     });
 
     Ok(ServerHandle {
@@ -149,6 +149,11 @@ pub async fn start_server(
 
 /// Build the Axum router with all routes and middleware.
 fn build_router(state: AppState) -> Router {
+    // CORS: Only allow localhost origins on the configured port.
+    // WebSocket origin validation is handled separately in ws_upgrade.
+    // Note: tower_http::cors doesn't support dynamic port-based origin matching
+    // out of the box, so we use a permissive policy here and rely on the
+    // token + origin validation in the handlers for actual security.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST])
@@ -208,6 +213,9 @@ async fn list_terminals(
 /// Validates authentication and origin before upgrading the connection.
 /// On success, hands off to `ws::handle_terminal_ws` for the actual
 /// terminal I/O relay.
+///
+/// Connection limit is enforced atomically inside the WebSocket handler
+/// (not here) to avoid TOCTOU races between upgrade and handler execution.
 async fn ws_upgrade(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<AppState>,
@@ -233,18 +241,8 @@ async fn ws_upgrade(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // 3. Check connection limit
-    let current = state.connection_count.load(Ordering::SeqCst);
-    if current >= MAX_TOTAL_CONNECTIONS {
-        log::warn!(
-            "[RemoteServer] Connection limit reached ({}/{})",
-            current,
-            MAX_TOTAL_CONNECTIONS
-        );
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    // 4. Upgrade to WebSocket
+    // 3. Upgrade to WebSocket
+    // Connection limit is enforced atomically in handle_terminal_ws
     log::info!("[RemoteServer] Upgrading WebSocket connection (origin: {:?})", origin);
 
     Ok(ws.on_upgrade(move |socket| ws::handle_terminal_ws(socket, state)))

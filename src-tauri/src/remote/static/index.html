@@ -350,6 +350,17 @@
     (function() {
         'use strict';
 
+        // === Security: HTML escaping to prevent XSS ===
+        function escapeHtml(str) {
+            if (typeof str !== 'string') return '';
+            return str
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
         // === State ===
         let ws = null;
         let token = null;
@@ -478,12 +489,15 @@
             }
 
             terminalListEl.innerHTML = terminalList.map(function(t) {
-                const name = t.shell ? t.shell.split('/').pop().split('\\').pop() : t.id;
+                const safeId = escapeHtml(t.id || '');
+                const safeShell = escapeHtml(t.shell || '');
+                const safeCwd = escapeHtml(t.cwd || t.id || '');
+                const name = safeShell ? safeShell.split('/').pop().split('\\').pop() : safeId;
                 const isActive = t.id === currentTerminalId;
-                return `<div class="terminal-item ${isActive ? 'active' : ''}" data-id="${t.id}" onclick="window._selectTerminal('${t.id}')">
-                    <span class="terminal-icon">📟</span>
-                    <span class="terminal-name" title="${t.cwd || t.id}">${name} <small style="opacity:0.5">${t.id.slice(-4)}</small></span>
-                </div>`;
+                return '<div class="terminal-item ' + (isActive ? 'active' : '') + '" data-id="' + safeId + '" onclick="window._selectTerminal(\'' + safeId + '\')">' +
+                    '<span class="terminal-icon">\uD83D\uDCDF</span>' +
+                    '<span class="terminal-name" title="' + safeCwd + '">' + name + ' <small style="opacity:0.5">' + escapeHtml(safeId.slice(-4)) + '</small></span>' +
+                    '</div>';
             }).join('');
         }
 
@@ -585,13 +599,16 @@
         // === Tab bar ===
         function renderTabs() {
             tabBarEl.innerHTML = Array.from(terminals.keys()).map(function(id) {
+                const safeId = escapeHtml(id);
                 const info = terminalList.find(function(t) { return t.id === id; });
-                const name = info ? (info.shell || '').split('/').pop().split('\\').pop() : id;
+                const rawName = info ? (info.shell || '') : id;
+                const name = rawName.split('/').pop().split('\\').pop();
+                const safeName = escapeHtml(name || safeId.slice(-6));
                 const isActive = id === currentTerminalId;
-                return `<div class="tab ${isActive ? 'active' : ''}" onclick="window._selectTerminal('${id}')">
-                    📟 ${name || id.slice(-6)}
-                    <span class="tab-close" onclick="event.stopPropagation(); window._closeTerminal('${id}')">✕</span>
-                </div>`;
+                return '<div class="tab ' + (isActive ? 'active' : '') + '" onclick="window._selectTerminal(\'' + safeId + '\')">' +
+                    '\uD83D\uDCDF ' + safeName +
+                    ' <span class="tab-close" onclick="event.stopPropagation(); window._closeTerminal(\'' + safeId + '\')">\u2715</span>' +
+                    '</div>';
             }).join('');
         }
 

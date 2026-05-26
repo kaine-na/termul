@@ -33,18 +33,37 @@ impl AuthState {
 
     /// Validate a provided token using constant-time comparison.
     ///
-    /// Returns `true` if the token matches. Uses constant-time comparison
-    /// to prevent timing-based side-channel attacks.
+    /// Returns `true` if the token matches. Uses byte-level XOR comparison
+    /// over the full length to prevent timing-based side-channel attacks.
+    /// Length mismatch is detected by XORing the lengths into the accumulator
+    /// rather than early-returning, so no timing information is leaked.
     pub fn validate_token(&self, provided: &str) -> bool {
-        // Constant-time comparison to prevent timing attacks
-        if provided.len() != self.token.len() {
-            return false;
+        let expected = self.token.as_bytes();
+        let given = provided.as_bytes();
+
+        // XOR length difference into accumulator — no early return on mismatch
+        let mut diff = (expected.len() ^ given.len()) as u8;
+
+        // Compare bytes up to the shorter length
+        let min_len = expected.len().min(given.len());
+        for i in 0..min_len {
+            diff |= expected[i] ^ given[i];
         }
-        let mut result = 0u8;
-        for (a, b) in self.token.bytes().zip(provided.bytes()) {
-            result |= a ^ b;
+
+        // If lengths differ, remaining bytes also contribute to diff
+        if expected.len() > min_len {
+            for &b in &expected[min_len..] {
+                diff |= b;
+            }
         }
-        result == 0
+        if given.len() > min_len {
+            for &b in &given[min_len..] {
+                diff |= b;
+            }
+        }
+
+        // Use volatile read to prevent compiler from optimizing away the loop
+        std::hint::black_box(diff) == 0
     }
 
     /// Validate the `Origin` header from a WebSocket upgrade request.
@@ -63,33 +82,33 @@ impl AuthState {
             return true;
         };
 
-        let allowed_prefixes = [
-            "http://localhost",
-            "https://localhost",
-            "http://127.0.0.1",
-            "https://127.0.0.1",
-            "http://[::1]",
-            "https://[::1]",
-            "null", // file:// or sandboxed origins
-        ];
-
-        // Check if origin matches localhost patterns
-        for prefix in &allowed_prefixes {
-            if origin.starts_with(prefix) {
-                // Verify port matches if specified in origin
-                if let Some(origin_port) = extract_port(origin) {
-                    return origin_port == port;
-                }
-                return true;
-            }
+        // Sandboxed iframes send "null" — allow for localhost-only server
+        if origin == "null" {
+            return true;
         }
 
-        // Also allow the exact server address
-        let self_addresses = [
-            format!("http://127.0.0.1:{port}"),
-            format!("http://localhost:{port}"),
+        // Parse the origin as a URL and extract the host:port portion.
+        // We do NOT use prefix matching to prevent bypasses like
+        // `http://localhost.evil.com:19480`.
+        let after_scheme = match origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+        {
+            Some(rest) => rest,
+            None => return false, // No recognized scheme
+        };
+
+        // Extract host:port (everything before the first `/`)
+        let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+
+        // Exact match against allowed host:port combinations
+        let allowed = [
+            format!("localhost:{port}"),
+            format!("127.0.0.1:{port}"),
+            format!("[::1]:{port}"),
         ];
-        self_addresses.iter().any(|addr| origin == addr)
+
+        allowed.iter().any(|h| host_port == h)
     }
 }
 
@@ -97,22 +116,6 @@ impl Default for AuthState {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Extract port number from an origin URL.
-fn extract_port(origin: &str) -> Option<u16> {
-    // Handle origins like "http://localhost:19480" or "http://127.0.0.1:19480"
-    let after_scheme = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))?;
-
-    // Find the port after the last colon
-    let colon_pos = after_scheme.rfind(':')?;
-    let port_str = &after_scheme[colon_pos + 1..];
-
-    // Port might be followed by a path
-    let port_str = port_str.split('/').next()?;
-    port_str.parse().ok()
 }
 
 /// Query parameters for WebSocket authentication.
@@ -167,6 +170,10 @@ mod tests {
             Some("http://127.0.0.1:19480"),
             19480
         ));
+        assert!(AuthState::validate_origin(
+            Some("https://localhost:19480"),
+            19480
+        ));
     }
 
     #[test]
@@ -190,8 +197,37 @@ mod tests {
     }
 
     #[test]
+    fn test_origin_validation_prefix_bypass() {
+        // These should NOT match — prefix matching bypass prevention
+        assert!(!AuthState::validate_origin(
+            Some("http://localhost.evil.com:19480"),
+            19480
+        ));
+        assert!(!AuthState::validate_origin(
+            Some("http://localhostattacker.io:19480"),
+            19480
+        ));
+        assert!(!AuthState::validate_origin(
+            Some("http://127.0.0.1.evil.com:19480"),
+            19480
+        ));
+    }
+
+    #[test]
     fn test_origin_validation_null() {
         assert!(AuthState::validate_origin(Some("null"), 19480));
+    }
+
+    #[test]
+    fn test_origin_validation_ipv6() {
+        assert!(AuthState::validate_origin(
+            Some("http://[::1]:19480"),
+            19480
+        ));
+        assert!(!AuthState::validate_origin(
+            Some("http://[::1]:9999"),
+            19480
+        ));
     }
 
     #[test]

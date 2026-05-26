@@ -191,6 +191,9 @@ pub struct TerminalInstance {
     pub renderer_refs: Arc<RwLock<HashSet<String>>>,
     pub cols: Arc<RwLock<u16>>,
     pub rows: Arc<RwLock<u16>>,
+    /// Atomic counter for remote WebSocket connections (TOCTOU-safe).
+    /// Separate from renderer_refs to allow lock-free limit enforcement.
+    pub remote_connections: AtomicUsize,
     #[cfg(target_os = "windows")]
     pub conpty_handles: Option<Arc<ParkingMutex<Option<ConPtyHandles>>>>,
 }
@@ -224,6 +227,34 @@ impl TerminalInstance {
     /// Check if terminal has no renderer references
     pub fn is_orphan(&self) -> bool {
         self.renderer_refs.read().is_empty()
+    }
+
+    /// Atomically try to reserve a remote connection slot.
+    /// Returns `true` if the connection was reserved (within limit),
+    /// `false` if the limit was already reached.
+    ///
+    /// Uses compare-exchange loop to prevent TOCTOU races between
+    /// concurrent WebSocket upgrade handlers.
+    pub fn try_add_remote_connection(&self, limit: usize) -> bool {
+        loop {
+            let current = self.remote_connections.load(Ordering::SeqCst);
+            if current >= limit {
+                return false;
+            }
+            if self
+                .remote_connections
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+            // CAS failed — another thread modified the counter, retry
+        }
+    }
+
+    /// Release a remote connection slot.
+    pub fn remove_remote_connection(&self) {
+        self.remote_connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -534,6 +565,7 @@ impl PtyManager {
                 renderer_refs: Arc::new(RwLock::new(HashSet::new())),
                 cols: Arc::new(RwLock::new(cols)),
                 rows: Arc::new(RwLock::new(rows)),
+                remote_connections: AtomicUsize::new(0),
                 conpty_handles: Some(Arc::new(ParkingMutex::new(Some(conpty_handles)))),
             });
 
@@ -658,6 +690,7 @@ impl PtyManager {
                 renderer_refs: Arc::new(RwLock::new(HashSet::new())),
                 cols: Arc::new(RwLock::new(cols)),
                 rows: Arc::new(RwLock::new(rows)),
+                remote_connections: AtomicUsize::new(0),
                 #[cfg(target_os = "windows")]
                 conpty_handles: None,
             });
@@ -888,18 +921,32 @@ impl PtyManager {
             };
 
             if let Some(data) = chunk {
-                // Send to Tauri channel (desktop frontend)
-                if let Some(ref channel) = on_data {
-                    if let Err(e) = channel.send(Response::new(data.clone())) {
-                        log::error!("[PTY {}] Failed to send data via channel: {}", id, e);
+                // Send to both Tauri channel and broadcast, cloning only when needed.
+                // When only one destination exists, we move ownership without cloning.
+                match (on_data.as_ref(), broadcast_tx.as_ref()) {
+                    (Some(channel), Some(tx)) => {
+                        // Both active — must clone for channel, move original to broadcast
+                        if let Err(e) = channel.send(Response::new(data.clone())) {
+                            log::error!("[PTY {}] Failed to send data via channel: {}", id, e);
+                        }
+                        if let Err(e) = tx.send(data) {
+                            log::trace!("[PTY {}] Broadcast send failed (no receivers): {}", id, e);
+                        }
                     }
-                }
-
-                // Relay to broadcast channel (remote WebSocket clients)
-                // Note: send() is non-blocking and safe to call from std::thread
-                if let Some(ref tx) = broadcast_tx {
-                    if let Err(e) = tx.send(data) {
-                        log::trace!("[PTY {}] Broadcast send failed (no receivers): {}", id, e);
+                    (Some(channel), None) => {
+                        // Only Tauri channel — move without clone
+                        if let Err(e) = channel.send(Response::new(data)) {
+                            log::error!("[PTY {}] Failed to send data via channel: {}", id, e);
+                        }
+                    }
+                    (None, Some(tx)) => {
+                        // Only broadcast — move without clone
+                        if let Err(e) = tx.send(data) {
+                            log::trace!("[PTY {}] Broadcast send failed (no receivers): {}", id, e);
+                        }
+                    }
+                    (None, None) => {
+                        // Unreachable — early return at top of function guards this
                     }
                 }
             }

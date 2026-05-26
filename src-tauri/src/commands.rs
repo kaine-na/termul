@@ -1386,6 +1386,7 @@ pub async fn remote_start(
                 "token": token,
                 "url": url,
                 "bindLan": bind_lan,
+                "warning": "\u{26a0}\u{fe0f} Token grants full terminal access. Share securely and revoke when done.",
             });
 
             // Store handle
